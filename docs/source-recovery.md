@@ -61,8 +61,9 @@
 python3 -m venv /tmp/qas-venv
 /tmp/qas-venv/bin/pip install -r requirements.txt
 /tmp/qas-venv/bin/python -m unittest discover -s tests -v
+docker tag <当前v0.8.7镜像ID> quark-auto-save-base:v0.8.7
 docker build -f Dockerfile.fork --pull=false \
-  --build-arg BASE_IMAGE=<当前v0.8.7镜像ID> \
+  --build-arg BASE_IMAGE=quark-auto-save-base:v0.8.7 \
   --build-arg FORK_REVISION="$(git rev-parse HEAD)" \
   -t quark-auto-save-fork:source-recovery .
 ```
