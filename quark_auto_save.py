@@ -18,6 +18,9 @@ import requests
 import importlib
 import traceback
 import urllib.parse
+import copy
+import tempfile
+from contextlib import contextmanager
 from datetime import datetime
 from natsort import natsorted
 
@@ -31,6 +34,7 @@ except:
 
 
 CONFIG_DATA = {}
+CONFIG_PATH = os.environ.get("CONFIG_PATH")
 NOTIFYS = []
 GH_PROXY = os.environ.get("GH_PROXY", "https://ghproxy.net/")
 
@@ -76,10 +80,109 @@ class Config:
             data = json.load(f)
         return data
 
+    @contextmanager
+    def edit_json(config_path):
+        """Serialize cross-process edits and preserve unrelated settings."""
+        path = os.path.abspath(config_path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".lock", "a+b") as lock:
+            os.chmod(lock.name, 0o600)
+            if os.name == "nt":
+                import msvcrt
+                lock.write(b"\0")
+                lock.flush()
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                data = Config.read_json(path) if os.path.exists(path) else {}
+                yield data
+                Config._write_json(path, data)
+            finally:
+                if os.name == "nt":
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+
+    def _write_json(path, data):
+        fd, temp = tempfile.mkstemp(prefix=".qas-", dir=os.path.dirname(path))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, sort_keys=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp, path)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+
     # 将数据写入 JSON 文件
     def write_json(config_path, data):
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, sort_keys=False, indent=2)
+        with Config.edit_json(config_path) as current:
+            current.clear()
+            current.update(data)
+
+    def persist_source(config_path, task, previous_fingerprint):
+        from source_recovery import task_fingerprint
+        with Config.edit_json(config_path) as current:
+            matches = [t for t in current.get("tasklist", [])
+                       if (t.get("taskname"), t.get("savepath")) ==
+                          (task.get("taskname"), task.get("savepath"))]
+            if len(matches) != 1 or task_fingerprint(matches[0]) != previous_fingerprint:
+                return False
+            matches[0]["shareurl"] = task["shareurl"]
+            if task.get("shareurl_ban"):
+                matches[0]["shareurl_ban"] = task["shareurl_ban"]
+            else:
+                matches[0].pop("shareurl_ban", None)
+        return True
+
+    def merge_run(config_path, before, after):
+        """Apply runtime changes only where the user has not edited meanwhile."""
+        missing = object()
+
+        def merge(base, updated, current):
+            if updated == base:
+                return current
+            if current == base:
+                return updated
+            if all(isinstance(x, dict) for x in (base, updated, current)):
+                result = dict(current)
+                for key in base.keys() | updated.keys():
+                    value = merge(base.get(key, missing), updated.get(key, missing),
+                                  current.get(key, missing))
+                    if value is missing:
+                        result.pop(key, None)
+                    else:
+                        result[key] = value
+                return result
+            return current
+
+        identity = lambda t: (t.get("taskname"), t.get("savepath"))
+        with Config.edit_json(config_path) as current:
+            base_tasks = before.get("tasklist", [])
+            run_tasks = after.get("tasklist", [])
+            tasks = current.get("tasklist", [])
+            merged = copy.deepcopy(merge(before, after, current))
+            # A reordered/deleted task is matched by identity, never by list index.
+            result = []
+            for task in tasks:
+                base = [t for t in base_tasks if identity(t) == identity(task)]
+                run = [t for t in run_tasks if identity(t) == identity(task)]
+                if len(base) == 1 and len(run) == 1:
+                    result.append(run[0] if task == base[0] else task)
+                elif len(base) != 1 or run or task != base[0]:
+                    result.append(task)
+            for task in run_tasks:
+                if not any(identity(t) == identity(task) for t in base_tasks + tasks):
+                    result.append(task)
+            if "tasklist" in current or "tasklist" in after:
+                merged["tasklist"] = result
+            current.clear()
+            current.update(merged)
 
     # 读取CK
     def get_cookies(cookie_val):
@@ -425,7 +528,7 @@ class Quark:
             # response.raise_for_status()  # 检查请求是否成功，但返回非200也会抛出异常
             return response
         except Exception as e:
-            print(f"_send_request error:\n{e}")
+            print(f"_send_request error: {type(e).__name__}")
             fake_response = requests.Response()
             fake_response.status_code = 500
             fake_response._content = (
@@ -836,7 +939,33 @@ class Quark:
             print(f"❌ 转存测试失败: {str(e)}")
             traceback.print_exc()
 
-    def do_save_task(self, task):
+    def recover_source(self, task, *, mode="check", force=False,
+                       expected_episode=None, candidate_id=None, config=None,
+                       config_path=None):
+        from source_recovery import resolve_task
+        config = CONFIG_DATA if config is None else config
+        path = config_path or CONFIG_PATH
+        if not path:
+            raise ValueError("source recovery requires CONFIG_PATH")
+        result = resolve_task(task, config, self, path + ".sources.json",
+                              mode=mode, force=force, expected_episode=expected_episode,
+                              candidate_id=candidate_id,
+                              persist=lambda updated, fingerprint:
+                                  Config.persist_source(path, updated, fingerprint))
+        return result
+
+    def do_save_task(self, task, expected_episode=None):
+        if (task.get("source_recovery") or {}).get("enabled") is True:
+            try:
+                result = self.recover_source(task, expected_episode=expected_episode)
+                print(f"来源检查：{result['message']}")
+                if result.get("status") in {"busy", "conflict", "rule_mismatch", "account_error"}:
+                    return
+                if not result.get("switched") and result.get("current_source", {}).get("health") != "healthy":
+                    return
+            except Exception as exc:
+                print(f"来源检查失败：{type(exc).__name__}；本次不转存")
+                return
         # 判断资源失效记录
         if task.get("shareurl_ban"):
             print(f"《{task['taskname']}》：{task['shareurl_ban']}")
@@ -923,6 +1052,17 @@ class Quark:
         need_save_list = []
         # 添加符合的
         for share_file in share_file_list:
+            policy = task.get("source_recovery") or {}
+            if policy.get("enabled") is True:
+                from source_recovery import parse_episode, VIDEO, EXTRAS
+                name = share_file["file_name"]
+                if share_file["dir"]:
+                    continue  # Recovery validates a video leaf, never sibling folders.
+                season, episode = parse_episode(name, f"Season {policy.get('season', 1)}")
+                if (not VIDEO.search(name) or EXTRAS.search(name)
+                        or season != policy.get("season", 1)
+                        or not episode or episode < policy.get("min_episode", 1)):
+                    continue
             search_pattern = (
                 task["update_subdir"]
                 if share_file["dir"] and task.get("update_subdir")
@@ -1241,13 +1381,15 @@ def do_save(account, tasklist=[]):
 
 
 def main():
-    global CONFIG_DATA
+    global CONFIG_DATA, CONFIG_PATH
     start_time = datetime.now()
     print(f"===============程序开始===============")
     print(f"⏰ 执行时间: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
     print()
     # 读取启动参数
     config_path = sys.argv[1] if len(sys.argv) > 1 else "quark_config.json"
+    CONFIG_PATH = config_path
+    config_before = {}
     # 推送测试
     if os.environ.get("QUARK_TEST", "").lower() == "true":
         print(f"===============通知测试===============")
@@ -1287,6 +1429,7 @@ def main():
     else:
         print(f"⚙️ 正从 {config_path} 文件中读取配置")
         CONFIG_DATA = Config.read_json(config_path)
+        config_before = copy.deepcopy(CONFIG_DATA)
         Config.breaking_change_update(CONFIG_DATA)
         cookie_val = CONFIG_DATA.get("cookie")
         cookie_form_file = True
@@ -1322,7 +1465,7 @@ def main():
         print()
     if cookie_form_file:
         # 更新配置
-        Config.write_json(config_path, CONFIG_DATA)
+        Config.merge_run(config_path, config_before, CONFIG_DATA)
 
     print(f"===============程序结束===============")
     duration = datetime.now() - start_time

@@ -28,6 +28,8 @@ import base64
 import sys
 import os
 import re
+import copy
+import threading
 
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, parent_dir)
@@ -77,6 +79,9 @@ TASK_TIMEOUT = int(os.environ.get("TASK_TIMEOUT", 1800))
 
 config_data = {}
 task_plugins_config_default = {}
+recovery_executor = ThreadPoolExecutor(max_workers=2)
+recovery_jobs = {}
+recovery_jobs_lock = threading.Lock()
 
 app = Flask(__name__)
 app.config["APP_VERSION"] = get_app_ver()
@@ -177,10 +182,17 @@ def get_data():
     if not is_login():
         return jsonify({"success": False, "message": "未登录"})
     data = Config.read_json(CONFIG_PATH)
+    revision = config_revision(data)
     del data["webui"]
     data["api_token"] = get_login_token()
     data["task_plugins_config_default"] = task_plugins_config_default
+    data["config_revision"] = revision
     return jsonify({"success": True, "data": data})
+
+
+def config_revision(data):
+    return hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False,
+                                    separators=(",", ":")).encode()).hexdigest()
 
 
 # 更新数据
@@ -191,21 +203,129 @@ def update():
         return jsonify({"success": False, "message": "未登录"})
     # 使用允许列表防止批量赋值攻击
     allowed_keys = ["cookie", "crontab", "push_config", "tasklist",
-                    "magic_regex", "plugins", "source"]
-    for key, value in request.json.items():
-        if key in allowed_keys:
-            config_data.update({key: value})
-    Config.write_json(CONFIG_PATH, config_data)
+                    "magic_regex", "plugins", "source", "source_recovery_ai"]
+    if not isinstance(request.json, dict):
+        return jsonify({"success": False, "message": "配置格式无效"}), 400
+    with Config.edit_json(CONFIG_PATH) as current:
+        revision = request.headers.get("X-Config-Revision")
+        if revision and revision != config_revision(current):
+            return jsonify({"success": False, "message": "配置已在服务器更新，请刷新后重试"}), 409
+        for key, value in request.json.items():
+            if key in allowed_keys:
+                current[key] = value
+        config_data = copy.deepcopy(current)
+        revision = config_revision(current)
     # 重新加载任务
     if reload_tasks():
         logging.info(f">>> 配置更新成功")
-        return jsonify({"success": True, "message": "配置更新成功"})
+        return jsonify({"success": True, "message": "配置更新成功", "config_revision": revision})
     else:
         logging.info(f">>> 配置更新失败")
         return jsonify({"success": False, "message": "配置更新失败"})
 
 
 # 处理运行脚本请求
+def recovery_task(index):
+    cfg = Config.read_json(CONFIG_PATH)
+    if type(index) is not int or not 0 <= index < len(cfg.get("tasklist", [])):
+        raise ValueError("invalid task index")
+    return cfg, copy.deepcopy(cfg["tasklist"][index])
+
+
+def recovery_view(task, result):
+    states = {"busy": "checking", "disabled": "idle", "changed": "idle",
+              "candidates_ready": "needs_confirmation", "confirmation_required": "needs_confirmation",
+              "no_source": "no_candidate", "waiting": "healthy", "switched": "switched",
+              "healthy": "healthy", "idle": "idle"}
+    history = result.get("history", [])
+    data = {"state": states.get(result.get("status"), "error"),
+            "checked_at": result.get("checked_at"), "reason": result.get("message", ""),
+            "source_latest": result.get("latest_episode"),
+            "last_switch_at": history[-1].get("at") if history else None,
+            "last_switch_reason": history[-1].get("reason") if history else None,
+            "current_shareurl": task.get("shareurl"), "candidates": []}
+    for candidate in result.get("candidates", []):
+        data["candidates"].append({
+            "candidate_id": candidate["id"], "title": candidate.get("title"),
+            "source": candidate.get("source"), "latest_episode": candidate.get("latest_episode"),
+            "episodes": candidate.get("episodes", []), "files": candidate.get("files", []),
+            "reasons": [candidate.get("reason", "")],
+            "can_apply": candidate.get("decision") == "accepted"})
+    return data
+
+
+@app.route("/source_recovery_status")
+def source_recovery_status():
+    if not is_login():
+        return jsonify({"success": False, "message": "未登录"}), 401
+    from source_recovery import read_status, task_key, task_fingerprint
+    try:
+        _, task = recovery_task(int(request.args.get("task_index", "")))
+        if (request.args.get("taskname", task.get("taskname")) != task.get("taskname")
+                or request.args.get("savepath", task.get("savepath")) != task.get("savepath")):
+            return jsonify({"success": False, "message": "任务顺序已变化，请刷新"}), 409
+        result = read_status(task, CONFIG_PATH + ".sources.json")
+        with recovery_jobs_lock:
+            job = recovery_jobs.get(task_key(task))
+            if job and job["fingerprint"] == task_fingerprint(task):
+                if job.get("phase"):
+                    data = recovery_view(task, result)
+                    data.update(state=job["phase"], reason="正在检查实际视频文件，请勿重复提交")
+                    return jsonify({"success": True, "data": data})
+                if job.get("error"):
+                    result = {"status": "error", "message": job["error"]}
+        return jsonify({"success": True, "data": recovery_view(task, result)})
+    except (ValueError, TypeError, KeyError):
+        return jsonify({"success": False, "message": "任务无效或配置已变化，请刷新"}), 400
+
+
+@app.route("/source_recovery", methods=["POST"])
+def source_recovery():
+    if not is_login():
+        return jsonify({"success": False, "message": "未登录"}), 401
+    from source_recovery import read_status, task_key, task_fingerprint
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict) or body.get("mode") not in {"check", "search", "apply"}:
+        return jsonify({"success": False, "message": "操作格式无效"}), 400
+    try:
+        cfg, task = recovery_task(body.get("task_index"))
+        if request.headers.get("X-Config-Revision") != config_revision(cfg):
+            return jsonify({"success": False, "message": "配置已在服务器更新，请刷新后重试"}), 409
+        cookies = Config.get_cookies(cfg.get("cookie"))
+        if not cookies:
+            return jsonify({"success": False, "message": "请先配置有效的夸克凭证"}), 400
+        if body["mode"] == "apply" and not isinstance(body.get("candidate_id"), str):
+            return jsonify({"success": False, "message": "候选无效，请重新搜索"}), 400
+        key, fingerprint = task_key(task), task_fingerprint(task)
+        with recovery_jobs_lock:
+            if recovery_jobs.get(key, {}).get("phase"):
+                return jsonify({"success": False, "message": "来源检查正在进行，请勿重复提交"}), 409
+            if sum(bool(j.get("phase")) for j in recovery_jobs.values()) >= 4:
+                return jsonify({"success": False, "message": "检查任务较多，请稍后重试"}), 429
+            phase = "applying" if body["mode"] == "apply" else "searching" if body["mode"] == "search" else "checking"
+            recovery_jobs[key] = {"phase": phase, "fingerprint": fingerprint}
+
+        def work():
+            try:
+                result = Quark(cookies[0]).recover_source(
+                    task, config=cfg, config_path=CONFIG_PATH, mode=body["mode"],
+                    force=True, candidate_id=body.get("candidate_id"))
+                error = (result["message"] + "；本次未执行，请稍后重试"
+                         if result.get("status") in {"conflict", "busy"} else None)
+            except Exception as exc:
+                logging.error("来源检查失败: %s", type(exc).__name__)
+                error = "来源检查失败，请核对任务的固定剧名、季集、规则及服务凭证"
+            with recovery_jobs_lock:
+                recovery_jobs[key] = {"phase": None, "fingerprint": task_fingerprint(task), "error": error}
+
+        recovery_executor.submit(work)
+        data = recovery_view(task, read_status(task, CONFIG_PATH + ".sources.json"))
+        data.update(state=phase, reason="任务已提交，正在检查实际视频文件")
+        return jsonify({"success": True, "message": "任务已提交", "data": data}), 202
+    except (ValueError, TypeError, KeyError):
+        return jsonify({"success": False, "message": "任务无效或配置已变化，请刷新"}), 400
+
+
 @app.route("/run_script_now", methods=["POST"])
 def run_script_now():
     if not is_login():
@@ -279,8 +399,10 @@ def get_task_suggestions():
             search = cs.auto_login_search(query)
             if search.get("success"):
                 if search.get("new_token"):
-                    cs_data["token"] = search.get("new_token")
-                    Config.write_json(CONFIG_PATH, config_data)
+                    with Config.edit_json(CONFIG_PATH) as current:
+                        latest = current.get("source", {}).get("cloudsaver", {})
+                        if all(latest.get(k) == cs_data.get(k) for k in ("server", "username", "password")):
+                            latest["token"] = search["new_token"]
                 search_results = cs.clean_search_results(search.get("data"))
                 return search_results
         return []
@@ -527,8 +649,9 @@ def add_task():
     if not request_data.get("addition"):
         request_data["addition"] = task_plugins_config_default
     # 添加任务
-    config_data["tasklist"].append(request_data)
-    Config.write_json(CONFIG_PATH, config_data)
+    with Config.edit_json(CONFIG_PATH) as current:
+        current.setdefault("tasklist", []).append(request_data)
+        config_data = copy.deepcopy(current)
     logging.info(f">>> 通过API添加任务: {request_data['taskname']}")
     return jsonify(
         {"success": True, "code": 0, "message": "任务添加成功", "data": request_data}

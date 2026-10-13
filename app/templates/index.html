@@ -273,6 +273,33 @@
               </div>
             </div>
 
+            <div class="row title"><div class="col"><h2>换源 AI 辅助（可选）</h2></div></div>
+            <div class="border rounded p-3 mb-3">
+              <div class="form-check mb-2">
+                <input id="recovery-ai-enabled" class="form-check-input" type="checkbox" v-model="formData.source_recovery_ai.enabled">
+                <label class="form-check-label" for="recovery-ai-enabled">启用候选判断辅助</label>
+              </div>
+              <small class="text-muted d-block mb-3">规则先校验真实文件。只有任务允许且候选难以确定时才调用模型；关闭后仍可按规则查找备源。</small>
+              <div v-if="formData.source_recovery_ai.enabled" class="form-row">
+                <div class="form-group col-md-6">
+                  <label for="recovery-ai-url">模型服务地址</label>
+                  <input id="recovery-ai-url" class="form-control" type="url" v-model="formData.source_recovery_ai.base_url" placeholder="兼容 OpenAI 的接口地址">
+                </div>
+                <div class="form-group col-md-6">
+                  <label for="recovery-ai-model">模型名称</label>
+                  <input id="recovery-ai-model" class="form-control" v-model="formData.source_recovery_ai.model" placeholder="服务中实际可用的模型">
+                </div>
+                <div class="form-group col-md-6">
+                  <label for="recovery-ai-key">API Key</label>
+                  <input id="recovery-ai-key" class="form-control" type="password" autocomplete="new-password" v-model="formData.source_recovery_ai.api_key" placeholder="可直接填写，或使用右侧环境变量">
+                </div>
+                <div class="form-group col-md-6">
+                  <label for="recovery-ai-env">密钥环境变量名（可选）</label>
+                  <input id="recovery-ai-env" class="form-control" v-model="formData.source_recovery_ai.api_key_env" placeholder="已在服务器设置的变量名">
+                </div>
+              </div>
+            </div>
+
           </div>
 
           <div v-if="activeTab === 'tasklist'">
@@ -312,9 +339,10 @@
               <template v-if="(taskDirSelected == '' || getParentDirectory(task.savepath) == taskDirSelected) && task.taskname.includes(taskNameFilter)">
                 <hr>
                 <div class="form-group row" style="align-items:center">
-                  <div class="col pl-0" data-toggle="collapse" :data-target="'#collapse_'+index" aria-expanded="true" :aria-controls="'collapse_'+index">
+                  <div class="col pl-0" data-toggle="collapse" :data-target="'#collapse_'+index" aria-expanded="true" :aria-controls="'collapse_'+index" @click="readRecoveryStatus(index)">
                     <div class="btn btn-block text-left">
                       <i class="bi bi-caret-right-fill"></i> #<span>{{ index+1 }}: {{ task.taskname }}</span>
+                      <span v-if="task.source_recovery && task.source_recovery.enabled" class="badge ml-2" :class="recoveryBadge(index)">{{ recoveryLabel(index) }}</span>
                     </div>
                   </div>
                   <div class="col-auto">
@@ -369,6 +397,77 @@
                             <a target="_blank" :href="task.shareurl"><i class="bi bi-box-arrow-up-right"></i></a>
                           </div>
                         </div>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="border rounded p-3 mb-3" v-if="task.source_recovery">
+                    <div class="d-flex flex-wrap align-items-center justify-content-between mb-2">
+                      <div class="form-check mr-3">
+                        <input class="form-check-input" type="checkbox" :id="'recovery-enabled-'+index" v-model="task.source_recovery.enabled" :disabled="recoveryBusy(index)">
+                        <label class="form-check-label font-weight-bold" :for="'recovery-enabled-'+index">失效自动换源</label>
+                      </div>
+                      <span class="badge" :class="recoveryBadge(index)" aria-live="polite">{{ recoveryLabel(index) }}</span>
+                    </div>
+                    <small class="text-muted d-block">固定作品身份，按分享里的真实文件识别季和集；电影、剧场版和花絮会排除。</small>
+                    <fieldset v-if="task.source_recovery.enabled" :disabled="recoveryBusy(index)" class="mt-3 border-0 p-0">
+                      <div class="form-row">
+                        <div class="form-group col-md-6">
+                          <label :for="'recovery-title-'+index">固定作品名</label>
+                          <input class="form-control" :id="'recovery-title-'+index" v-model="task.source_recovery.title" maxlength="100" placeholder="例如：遮天">
+                        </div>
+                        <div class="form-group col-md-6">
+                          <label :for="'recovery-aliases-'+index">别名（可选，用逗号分隔）</label>
+                          <input class="form-control" :id="'recovery-aliases-'+index" :value="task.source_recovery.aliases.join('，')" @input="recoveryAliases(index, $event.target.value)" placeholder="例如：Shrouding the Heavens">
+                        </div>
+                        <div class="form-group col-6 col-md-3">
+                          <label :for="'recovery-year-'+index">年份（可选）</label>
+                          <input class="form-control" type="number" :id="'recovery-year-'+index" v-model.number="task.source_recovery.year" min="1900" max="2100" placeholder="例如：2023">
+                        </div>
+                        <div class="form-group col-6 col-md-3">
+                          <label :for="'recovery-season-'+index">季</label>
+                          <input class="form-control" type="number" :id="'recovery-season-'+index" v-model.number="task.source_recovery.season" min="1" max="999">
+                        </div>
+                        <div class="form-group col-6 col-md-3">
+                          <label :for="'recovery-min-'+index">追更起始集</label>
+                          <input class="form-control" type="number" :id="'recovery-min-'+index" v-model.number="task.source_recovery.min_episode" min="1" max="100000">
+                        </div>
+                        <div class="form-group col-6 col-md-3">
+                          <label :for="'recovery-stale-'+index">未更新多久后查找（小时）</label>
+                          <input class="form-control" type="number" :id="'recovery-stale-'+index" v-model.number="task.source_recovery.stale_hours" min="1" max="720">
+                        </div>
+                      </div>
+                      <div class="form-check mb-2">
+                        <input class="form-check-input" type="checkbox" :id="'recovery-ai-'+index" v-model="task.source_recovery.allow_ai" :disabled="!formData.source_recovery_ai.enabled">
+                        <label class="form-check-label" :for="'recovery-ai-'+index">候选不确定时允许 AI 辅助判断</label>
+                      </div>
+                      <small v-if="!formData.source_recovery_ai.enabled" class="text-muted">AI 未启用，规则校验和手动确认仍可使用。可在系统配置中设置模型。</small>
+                    </fieldset>
+                    <div v-if="task.source_recovery.enabled" class="mt-3">
+                      <p v-if="recoveryStatus(index).reason" class="mb-1" aria-live="polite">{{ recoveryStatus(index).reason }}</p>
+                      <small class="text-muted d-block" v-if="recoveryStatus(index).checked_at">最近检测：{{ recoveryDate(recoveryStatus(index).checked_at) }}<span v-if="recoveryStatus(index).source_latest"> · 来源最新第 {{ recoveryStatus(index).source_latest }} 集</span></small>
+                      <small class="text-muted d-block" v-if="recoveryStatus(index).last_switch_at">最近换源：{{ recoveryDate(recoveryStatus(index).last_switch_at) }} · {{ recoveryStatus(index).last_switch_reason || '已通过文件校验' }}</small>
+                      <div v-if="recoveryErrors[index]" class="alert alert-warning py-2 mt-2 mb-2" role="alert">{{ recoveryErrors[index] }}</div>
+                      <p v-if="configModified" class="text-muted small mb-2 mt-2">配置有未保存的修改，请先点击页面底部的保存按钮，再检测或查找备源。</p>
+                      <div class="d-flex flex-wrap mt-2">
+                        <button type="button" class="btn btn-outline-secondary btn-sm mr-2 mb-2" @click="recoveryAction(index, 'check')" :disabled="configModified || recoveryBusy(index)">检测当前来源</button>
+                        <button type="button" class="btn btn-outline-primary btn-sm mb-2" @click="recoveryAction(index, 'search')" :disabled="configModified || recoveryBusy(index)">
+                          <span v-if="recoveryBusy(index)" class="spinner-border spinner-border-sm mr-1" aria-hidden="true"></span>{{ recoveryBusy(index) ? '正在处理…' : '查找备源' }}
+                        </button>
+                      </div>
+                      <div v-for="candidate in recoveryStatus(index).candidates || []" :key="candidate.candidate_id" class="border rounded p-3 mt-2">
+                        <div class="d-flex flex-wrap justify-content-between align-items-start">
+                          <strong class="mr-2">{{ candidate.title }}</strong><span class="badge badge-light">{{ candidate.source || '搜索来源' }}</span>
+                        </div>
+                        <p class="small text-muted mb-2 mt-1"><span v-if="candidate.year">{{ candidate.year }} · </span>第 {{ candidate.season || task.source_recovery.season }} 季<span v-if="candidate.latest_episode"> · 最新第 {{ candidate.latest_episode }} 集</span></p>
+                        <ul v-if="candidate.reasons && candidate.reasons.length" class="small pl-3 mb-2"><li v-for="(reason, rIndex) in candidate.reasons" :key="rIndex">{{ reason }}</li></ul>
+                        <details class="mb-2"><summary>查看已验证的视频文件（{{ (candidate.files || []).length }} 个）</summary>
+                          <div class="table-responsive mt-2"><table class="table table-sm mb-0">
+                            <thead><tr><th scope="col">文件名</th><th scope="col">季 / 集</th><th scope="col">大小</th></tr></thead>
+                            <tbody><tr v-for="(file, fIndex) in candidate.files || []" :key="fIndex"><td style="overflow-wrap:anywhere">{{ file.name }}</td><td>{{ file.season != null ? 'S'+file.season : '未识别' }}<span v-if="file.episode != null"> / E{{ file.episode }}</span></td><td class="text-nowrap">{{ file.size | size }}</td></tr></tbody>
+                          </table></div>
+                        </details>
+                        <small v-if="!recoveryCanApply(candidate)" class="text-muted d-block mb-2">文件校验尚未通过，暂不能使用这个来源。</small>
+                        <button type="button" class="btn btn-primary btn-sm" @click="recoveryAction(index, 'apply', candidate.candidate_id)" :disabled="configModified || recoveryBusy(index) || !recoveryCanApply(candidate)">确认使用此来源</button>
                       </div>
                     </div>
                   </div>
@@ -651,6 +750,7 @@
               server: ""
             }
           },
+          source_recovery_ai: {enabled: false, base_url: '', model: '', api_key_env: '', api_key: ''},
         },
         toasts: [],
         newTask: {
@@ -669,6 +769,13 @@
         taskDirSelected: "",
         taskNameFilter: "",
         modalLoading: false,
+        recoveryStates: {},
+        recoveryErrors: {},
+        recoveryRequests: {},
+        recoveryOwners: {},
+        recoverySavedLinks: {},
+        recoveryLastRead: {},
+        recoveryTimer: null,
         smart_param: {
           index: null,
           savepath: "",
@@ -681,6 +788,7 @@
         },
         activeTab: 'tasklist',
         configModified: false,
+        configRevision: '',
         fileSelect: {
           index: null,
           share: {},
@@ -721,6 +829,7 @@
       mounted() {
         this.fetchData();
         this.checkNewVersion();
+        this.recoveryTimer = setInterval(this.pollRecovery, 5000);
         $('[data-toggle="tooltip"]').tooltip();
         document.addEventListener('keydown', this.handleKeyDown);
         document.addEventListener('click', (e) => {
@@ -731,9 +840,106 @@
         window.addEventListener('beforeunload', this.handleBeforeUnload);
       },
       beforeDestroy() {
+        clearInterval(this.recoveryTimer);
         window.removeEventListener('beforeunload', this.handleBeforeUnload);
       },
       methods: {
+        recoveryPolicy(task) {
+          const saved = task.source_recovery || {};
+          return Object.assign({enabled: false, title: task.taskname || '', aliases: [], year: null,
+            season: 1, min_episode: 1, stale_hours: 24, allow_ai: false}, saved,
+            {aliases: Array.isArray(saved.aliases) ? saved.aliases : []});
+        },
+        recoveryAliases(index, value) {
+          this.formData.tasklist[index].source_recovery.aliases = [...new Set(value.split(/[,，\n]/).map(x => x.trim()).filter(Boolean))];
+        },
+        recoveryStatus(index) { return this.recoveryStates[index] || {state: 'idle'}; },
+        recoveryBusy(index) {
+          return !!this.recoveryRequests[index] || ['checking', 'searching', 'applying'].includes(this.recoveryStatus(index).state);
+        },
+        recoveryLabel(index) {
+          return ({idle: '待检测', checking: '检测中', healthy: '来源正常', searching: '查找备源中',
+            needs_confirmation: '候选待确认', switched: '已换源', no_candidate: '暂无合适备源',
+            error: '检测失败', applying: '正在换源'})[this.recoveryStatus(index).state] || '状态待确认';
+        },
+        recoveryBadge(index) {
+          const state = this.recoveryStatus(index).state;
+          return ['healthy', 'switched'].includes(state) ? 'badge-success' :
+            ['error', 'needs_confirmation', 'no_candidate'].includes(state) ? 'badge-warning' :
+            this.recoveryBusy(index) ? 'badge-info' : 'badge-light';
+        },
+        recoveryDate(value) {
+          if (!value) return '';
+          const date = new Date(typeof value === 'number' && value < 1e12 ? value * 1000 : value);
+          return Number.isNaN(date.getTime()) ? '时间未知' : date.toLocaleString('zh-CN', {timeZone: 'Asia/Shanghai', hour12: false});
+        },
+        recoveryCanApply(candidate) {
+          return !!candidate.candidate_id && candidate.can_apply !== false && Array.isArray(candidate.files) && candidate.files.length > 0;
+        },
+        receiveRecovery(index, task, response) {
+          if (this.formData.tasklist[index] !== task) return;
+          const body = response.data;
+          if (body.success === false) throw new Error(body.message || '请求未完成，请重试。');
+          const status = body.data || body;
+          if (!status.state) throw new Error('检测状态未返回，请稍后刷新。');
+          this.$set(this.recoveryStates, index, status);
+          this.$set(this.recoveryOwners, index, task);
+          this.$set(this.recoveryErrors, index, '');
+          if (status.current_shareurl && status.current_shareurl !== task.shareurl) {
+            if (this.configModified) {
+              this.$set(this.recoveryErrors, index, '来源已在服务器更换。请刷新页面核对，再保存你的修改。');
+              return;
+            }
+            this.$set(task, 'shareurl', status.current_shareurl);
+            this.$delete(task, 'shareurl_ban');
+            const expected = JSON.stringify(this.formData);
+            this.$nextTick(() => {
+              if (JSON.stringify(this.formData) === expected) {
+                this.configModified = false;
+                this.fetchData(expected);
+              }
+            });
+          }
+        },
+        async readRecoveryStatus(index) {
+          const task = this.formData.tasklist[index];
+          if (!task || this.configModified || !task.source_recovery || !task.source_recovery.enabled || this.recoveryRequests[index]) return;
+          if (this.recoveryOwners[index] && this.recoveryOwners[index] !== task) this.$delete(this.recoveryStates, index);
+          this.$set(this.recoveryRequests, index, true);
+          this.$set(this.recoveryLastRead, index, Date.now());
+          try {
+            this.receiveRecovery(index, task, await axios.get('/source_recovery_status', {params: {task_index: index, taskname: task.taskname, savepath: task.savepath}, timeout: 15000}));
+          } catch (error) {
+            if (this.formData.tasklist[index] === task) this.$set(this.recoveryErrors, index, '状态读取失败，请稍后重试。');
+          } finally { this.$delete(this.recoveryRequests, index); }
+        },
+        pollRecovery() {
+          if (document.hidden || this.configModified || this.activeTab !== 'tasklist') return;
+          this.formData.tasklist.forEach((task, index) => {
+            if (task.source_recovery && task.source_recovery.enabled && !this.recoveryRequests[index]
+                && Date.now() - (this.recoveryLastRead[index] || 0) >= (this.recoveryBusy(index) ? 5000 : 60000)) {
+              this.readRecoveryStatus(index);
+            }
+          });
+        },
+        async recoveryAction(index, mode, candidateId) {
+          const task = this.formData.tasklist[index];
+          if (!task || this.configModified || this.recoveryBusy(index)) return;
+          this.$set(this.recoveryRequests, index, true);
+          this.$set(this.recoveryErrors, index, '');
+          this.$set(this.recoveryStates, index, Object.assign({}, this.recoveryStatus(index),
+            {state: mode === 'search' ? 'searching' : mode === 'apply' ? 'applying' : 'checking'}));
+          try {
+            const body = {task_index: index, mode};
+            if (candidateId) body.candidate_id = candidateId;
+            this.receiveRecovery(index, task, await axios.post('/source_recovery', body, {headers: {'X-Config-Revision': this.configRevision}, timeout: 180000}));
+          } catch (error) {
+            if (this.formData.tasklist[index] === task) {
+              this.$set(this.recoveryStates, index, Object.assign({}, this.recoveryStatus(index), {state: 'error'}));
+              this.$set(this.recoveryErrors, index, error.response && error.response.data && error.response.data.message || '请求结果尚未确认，请检测当前状态后再操作。');
+            }
+          } finally { this.$delete(this.recoveryRequests, index); }
+        },
         changeTab(tab) {
           this.activeTab = tab;
           if (window.innerWidth <= 768) {
@@ -754,10 +960,13 @@
               console.error('Error:', error);
             });
         },
-        fetchData() {
+        fetchData(expectedSnapshot = null) {
           axios.get('/data')
             .then(response => {
+              if (expectedSnapshot && JSON.stringify(this.formData) !== expectedSnapshot) return;
               config_data = response.data.data
+              this.configRevision = config_data.config_revision || '';
+              delete config_data.config_revision;
               // cookie兼容
               if (typeof config_data.cookie === 'string')
                 config_data.cookie = [config_data.cookie];
@@ -766,6 +975,7 @@
                 if (!task.hasOwnProperty('runweek')) {
                   task.runweek = [1, 2, 3, 4, 5, 6, 7];
                 }
+                task.source_recovery = this.recoveryPolicy(task);
                 return task;
               });
               // 获取所有任务父目录
@@ -798,6 +1008,9 @@
                 };
               }
               this.formData = config_data;
+              this.$set(this.formData, 'source_recovery_ai', Object.assign({enabled: false, base_url: '', model: '', api_key_env: '', api_key: ''}, config_data.source_recovery_ai || {}));
+              this.recoveryStates = {}; this.recoveryOwners = {}; this.recoveryErrors = {}; this.recoveryLastRead = {};
+              this.recoverySavedLinks = Object.fromEntries(config_data.tasklist.map((task, index) => [index, task.shareurl]));
               setTimeout(() => {
                 this.configModified = false;
               }, 100);
@@ -825,10 +1038,27 @@
           }
         },
         saveConfig() {
-          axios.post('/update', this.formData)
+          if (!this.configRevision) {
+            this.showToast('未获取配置版本，请刷新页面后保存。', 'error'); return;
+          }
+          if (Object.keys(this.recoveryRequests).length || this.formData.tasklist.some((task, index) => this.recoveryBusy(index))) {
+            this.showToast('来源操作正在进行，请完成后再保存配置。', 'error'); return;
+          }
+          if (this.formData.tasklist.some((task, index) => this.recoveryStatus(index).current_shareurl
+              && this.recoveryStatus(index).current_shareurl !== this.recoverySavedLinks[index]
+              && this.recoveryStatus(index).current_shareurl !== task.shareurl)) {
+            this.showToast('来源已在服务器更新，请先刷新页面核对。', 'error'); return;
+          }
+          this.formData.tasklist.forEach(task => {
+            if (task.source_recovery && task.source_recovery.year === '') task.source_recovery.year = null;
+          });
+          axios.post('/update', this.formData, {headers: {'X-Config-Revision': this.configRevision}})
             .then(response => {
               if (response.data.success) {
                 this.configModified = false;
+                this.configRevision = response.data.config_revision || (response.data.data && response.data.data.config_revision) || '';
+                this.recoverySavedLinks = Object.fromEntries(this.formData.tasklist.map((task, index) => [index, task.shareurl]));
+                this.recoveryStates = {}; this.recoveryOwners = {}; this.recoveryLastRead = {};
                 this.showToast(response.data.message, 'success');
               } else {
                 this.showToast(response.data.message, 'error');
@@ -836,7 +1066,7 @@
               console.log('Config saved result:', response.data);
             })
             .catch(error => {
-              console.error('Error saving config:', error);
+              this.showToast(error.response && error.response.data && error.response.data.message || '保存失败，请稍后重试。', 'error');
             });
         },
         addCookie() {
@@ -861,6 +1091,7 @@
         addTask() {
           newTask = { ...this.newTask }
           newTask.taskname = this.taskNameFilter;
+          newTask.source_recovery = this.recoveryPolicy(newTask);
           if (this.formData.tasklist.length > 0) {
             lastTask = this.formData.tasklist[this.formData.tasklist.length - 1];
             if (this.taskDirSelected) {
@@ -904,8 +1135,11 @@
             task.savepath = this.smart_param.savepath.replace('TASKNAME', task.taskname);
         },
         removeTask(index) {
-          if (confirm("确认删除任务 [#" + (index + 1) + ": " + this.formData.tasklist[index].taskname + "] 吗？"))
+          if (this.recoveryBusy(index)) return;
+          if (confirm("确认删除任务 [#" + (index + 1) + ": " + this.formData.tasklist[index].taskname + "] 吗？")) {
             this.formData.tasklist.splice(index, 1);
+            this.recoveryStates = {}; this.recoveryOwners = {}; this.recoveryErrors = {}; this.recoveryLastRead = {};
+          }
         },
         changeShareurl(task) {
           if (!task.shareurl)
@@ -1368,6 +1602,7 @@
             try {
               let task = JSON.parse(text);
               task = { ...this.newTask, ...task };
+              task.source_recovery = this.recoveryPolicy(task);
               this.formData.tasklist.push(task);
               this.showToast("剪贴板参数已成功导入任务", "success");
               // 滚到最下

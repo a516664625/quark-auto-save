@@ -1,3 +1,7 @@
+# 此 fork 的来源恢复
+
+个人扩展：失效来源重新搜索、真实视频季集验证、每任务状态/候选预览，以及默认关闭的小模型辅助。使用和部署见 [自动换源说明](docs/source-recovery.md)。原项目说明保留在下方。
+
 <div align="center">
 
 ![quark-logo](img/icon.png)

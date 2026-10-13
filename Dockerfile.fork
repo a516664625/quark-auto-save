@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=ghcr.nju.edu.cn/cp0204/quark-auto-save:latest
+FROM ${BASE_IMAGE}
+ARG FORK_REVISION=dev
+COPY quark_auto_save.py source_recovery.py /app/
+COPY app/run.py /app/app/run.py
+COPY app/templates/index.html /app/app/templates/index.html
+ENV BUILD_TAG=source-recovery BUILD_SHA=${FORK_REVISION}
+LABEL org.opencontainers.image.source="https://github.com/a516664625/quark-auto-save"
+LABEL org.opencontainers.image.revision=${FORK_REVISION}
